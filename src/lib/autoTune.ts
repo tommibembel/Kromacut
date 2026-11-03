@@ -382,7 +382,7 @@ export function extractTargetColors(
  * background also moves away from small foreground colors.
  */
 export function expandContrast(targets: TargetColor[], strength: number, chroma = 1): TargetColor[] {
-    if (strength <= 0 && chroma === 1) return targets;
+    if (strength === 0 && chroma === 1) return targets;
     const Ls = targets.map((t) => t.lab.L);
     const mean = (Math.min(...Ls) + Math.max(...Ls)) / 2;
     return targets.map((t) => {
@@ -454,7 +454,151 @@ export function targetEdgeShares(pixels: ImagePixels, targets: TargetColor[], ed
     return sharp.map((row) => row.map((v) => (total ? v / total : 0)));
 }
 
+export type AutoTunePreset =
+    | 'faithful'
+    | 'balanced'
+    | 'bold'
+    | 'popArt'
+    | 'silhouette'
+    | 'grayscale'
+    | 'vintage';
+
+export const AUTO_TUNE_PRESETS: AutoTunePreset[] = [
+    'faithful',
+    'balanced',
+    'bold',
+    'popArt',
+    'silhouette',
+    'grayscale',
+    'vintage',
+];
+
+interface PresetDefinition {
+    options: Partial<Omit<AutoTuneOptions, 'preset' | 'layerHeight' | 'firstLayerHeight'>>;
+    /** Restyle the extracted targets before contrast/chroma search. */
+    style?: (targets: TargetColor[], filaments: Filament[]) => TargetColor[];
+    /** Restrict usable filaments (falls back to all if fewer than 2 remain). */
+    filamentFilter?: (f: Filament) => boolean;
+    /** Score fidelity against the styled targets instead of the original image colors. */
+    fidelityToStyled?: boolean;
+}
+
+const labOfHex = (hex: string) => rgbToLab(parseHex(hex));
+const targetFromLab = (lab: Lab, weight: number): TargetColor => {
+    const rgb = labToRgb(lab) as [number, number, number];
+    return { hex: hexOf(rgb), lab: rgbToLab(rgb), weight };
+};
+
+const PRESETS: Record<AutoTunePreset, PresetDefinition> = {
+    // as close as possible to the original colors
+    faithful: {
+        options: {
+            contrastStrengths: [0, 0.15, 0.3],
+            chromaBoosts: [1],
+            contrastWeight: 0.25,
+            extract: { mergeDeltaE: 7, maxTargets: 10 },
+        },
+    },
+    balanced: { options: {} },
+    // poster look: strong contrast, saturated, few areas
+    bold: {
+        options: {
+            contrastStrengths: [0.6, 1, 1.5],
+            chromaBoosts: [1.6, 2.2],
+            contrastWeight: 0.8,
+            extract: { mergeDeltaE: 14, maxTargets: 6 },
+        },
+    },
+    // Warhol style: few flat areas, hues replaced by the most vivid filaments,
+    // only the light/dark order of the image is kept
+    popArt: {
+        options: {
+            contrastStrengths: [0, 0.5],
+            chromaBoosts: [1],
+            contrastWeight: 0.7,
+            extract: { mergeDeltaE: 22, maxTargets: 5, distinctDeltaE: 40 },
+        },
+        fidelityToStyled: true,
+        style: (targets, filaments) => {
+            const pool = filaments.map((f) => ({ f, lab: labOfHex(f.color) }));
+            const used = new Set<string>();
+            const byL = [...targets].sort((a, b) => a.lab.L - b.lab.L);
+            const lMin = byL[0]?.lab.L ?? 0;
+            const lMax = byL[byL.length - 1]?.lab.L ?? 100;
+            const fl = pool.map((p) => p.lab.L);
+            const fMin = Math.min(...fl);
+            const fMax = Math.max(...fl);
+            const mapped = new Map<TargetColor, TargetColor>();
+            for (const t of byL) {
+                // map image lightness range onto filament lightness range
+                const rel = lMax > lMin ? (t.lab.L - lMin) / (lMax - lMin) : 0.5;
+                const wantL = fMin + rel * (fMax - fMin);
+                let best = pool[0];
+                let bestScore = -Infinity;
+                for (const p of pool) {
+                    const chroma = Math.hypot(p.lab.a, p.lab.b);
+                    const score = chroma - 1.5 * Math.abs(p.lab.L - wantL) - (used.has(p.f.id) ? 60 : 0);
+                    if (score > bestScore) {
+                        bestScore = score;
+                        best = p;
+                    }
+                }
+                used.add(best.f.id);
+                mapped.set(t, targetFromLab(best.lab, t.weight));
+            }
+            return targets.map((t) => mapped.get(t)!);
+        },
+    },
+    // 2–3 lightness levels, maximal legibility
+    silhouette: {
+        options: {
+            contrastStrengths: [0.6, 1, 1.5],
+            chromaBoosts: [1],
+            contrastWeight: 0.9,
+            extract: { mergeDeltaE: 25, maxTargets: 3, distinctDeltaE: 45 },
+        },
+    },
+    // lightness only, neutral filaments
+    grayscale: {
+        options: { contrastStrengths: [0, 0.3, 0.6], chromaBoosts: [1], contrastWeight: 0.6 },
+        fidelityToStyled: true,
+        style: (targets) => targets.map((t) => targetFromLab({ L: t.lab.L, a: 0, b: 0 }, t.weight)),
+        filamentFilter: (f) => {
+            const lab = labOfHex(f.color);
+            return Math.hypot(lab.a, lab.b) < 12;
+        },
+    },
+    // softer, desaturated, warm
+    vintage: {
+        options: { contrastStrengths: [-0.25, -0.1], chromaBoosts: [0.6], contrastWeight: 0.4 },
+        fidelityToStyled: true,
+        style: (targets) =>
+            targets.map((t) => targetFromLab({ L: t.lab.L, a: t.lab.a * 0.6 + 2, b: t.lab.b * 0.6 + 7 }, t.weight)),
+    },
+};
+
+/**
+ * Pick at most `max` filaments that are most useful for the targets
+ * (always keeps the lightest one as a base for light colors).
+ */
+export function selectFilamentSubset(filaments: Filament[], targets: TargetColor[], max: number): Filament[] {
+    if (filaments.length <= max) return filaments;
+    const labs = filaments.map((f) => labOfHex(f.color));
+    const score = filaments.map((_, i) =>
+        targets.reduce((s, t) => s + Math.sqrt(t.weight) * Math.exp(-deltaE2000Lab(labs[i], t.lab) / 15), 0)
+    );
+    let lightest = 0;
+    for (let i = 1; i < labs.length; i++) if (labs[i].L > labs[lightest].L) lightest = i;
+    const order = filaments.map((_, i) => i).sort((a, b) => score[b] - score[a]);
+    const chosen = [lightest, ...order.filter((i) => i !== lightest)].slice(0, max);
+    return chosen.map((i) => filaments[i]);
+}
+
 export interface AutoTuneOptions {
+    /** Style preset; explicit options below override the preset. Default 'balanced'. */
+    preset?: AutoTunePreset;
+    /** Use at most this many filaments (e.g. 4 for one AMS unit). */
+    maxFilaments?: number;
     layerHeight: number;
     firstLayerHeight: number;
     maxHeight?: number;
@@ -494,9 +638,15 @@ export interface AutoTuneResult {
 
 export function autoTune(
     image: WeightedColor[] | ImagePixels,
-    filaments: Filament[],
-    options: AutoTuneOptions
+    allFilaments: Filament[],
+    userOptions: AutoTuneOptions
 ): AutoTuneResult {
+    const preset = PRESETS[userOptions.preset ?? 'balanced'];
+    const options: AutoTuneOptions = {
+        ...preset.options,
+        ...Object.fromEntries(Object.entries(userOptions).filter(([, v]) => v !== undefined)),
+        extract: { ...preset.options.extract, ...userOptions.extract },
+    } as AutoTuneOptions;
     const {
         layerHeight,
         firstLayerHeight,
@@ -507,13 +657,23 @@ export function autoTune(
         contrastWeight = 0.6,
         algorithm = 'balanced',
     } = options;
-    const original = extractTargetColors(image, options.extract);
-    const adjacency = Array.isArray(image) ? null : targetEdgeShares(image as ImagePixels, original);
+    const extracted = extractTargetColors(image, options.extract);
+    const adjacency = Array.isArray(image) ? null : targetEdgeShares(image as ImagePixels, extracted);
+    let filaments = allFilaments;
+    if (preset.filamentFilter) {
+        const f = allFilaments.filter(preset.filamentFilter);
+        if (f.length >= 2) filaments = f;
+    }
+    const styledBase = preset.style ? preset.style(extracted, filaments) : extracted;
+    if (options.maxFilaments && options.maxFilaments > 0)
+        filaments = selectFilamentSubset(filaments, styledBase, options.maxFilaments);
+    // reference for fidelity scoring
+    const original = preset.fidelityToStyled ? styledBase : extracted;
     const candidates: AutoTuneCandidate[] = [];
 
     for (const strength of contrastStrengths)
     for (const chroma of chromaBoosts) {
-        const targets = expandContrast(original, strength, chroma);
+        const targets = expandContrast(styledBase, strength, chroma);
         const swatches: AutoPaintImageSwatch[] = targets.map((t) => ({
             hex: t.hex,
             count: Math.max(1, Math.round(t.weight * 1e6)),
@@ -586,7 +746,7 @@ export function autoTune(
     if (candidates.length === 0) throw new Error('autoTune: no Auto-paint candidate could be generated');
     candidates.sort((x, y) => x.score - y.score);
     const best = candidates[0];
-    const unreachable = original
+    const unreachable = (preset.fidelityToStyled ? [] : original)
         .map((o, i) => ({
             hex: o.hex,
             weight: o.weight,
@@ -609,7 +769,7 @@ export function autoTune(
             return dh > 20;
         });
     return {
-        originalTargets: original,
+        originalTargets: extracted,
         best,
         // eslint-disable-next-line @typescript-eslint/no-unused-vars
         candidates: candidates.map(({ result, ...rest }) => rest),
