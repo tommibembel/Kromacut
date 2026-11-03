@@ -56,7 +56,11 @@ const parseHex = (hex: string): [number, number, number] => {
 const labDist2 = (a: Lab, b: Lab) => (a.L - b.L) ** 2 + (a.a - b.a) ** 2 + (a.b - b.b) ** 2;
 
 /** Weighted k-means in Lab with deterministic farthest-point seeding. */
-function kmeansLab(points: { lab: Lab; w: number }[], k: number, iterations = 25): { lab: Lab; w: number }[] {
+function kmeansLab(
+    points: { lab: Lab; w: number }[],
+    k: number,
+    iterations = 25
+): { lab: Lab; w: number }[] {
     if (points.length <= k) return points.map((p) => ({ lab: { ...p.lab }, w: p.w }));
     const centers: Lab[] = [];
     // seed: heaviest point, then farthest weighted
@@ -77,7 +81,8 @@ function kmeansLab(points: { lab: Lab; w: number }[], k: number, iterations = 25
         }
         if (best < 0 || bestScore <= 0) break;
         centers.push({ ...points[best].lab });
-        for (let i = 0; i < points.length; i++) minD[i] = Math.min(minD[i], labDist2(points[i].lab, points[best].lab));
+        for (let i = 0; i < points.length; i++)
+            minD[i] = Math.min(minD[i], labDist2(points[i].lab, points[best].lab));
     }
     const assign = new Int32Array(points.length);
     const weights = new Float64Array(centers.length);
@@ -124,7 +129,11 @@ export interface ImagePixels {
 }
 
 const binKey = (r: number, g: number, b: number) => ((r >> 2) << 12) | ((g >> 2) << 6) | (b >> 2);
-const binRgb = (k: number): [number, number, number] => [((k >> 12) & 63) << 2, ((k >> 6) & 63) << 2, (k & 63) << 2];
+const binRgb = (k: number): [number, number, number] => [
+    ((k >> 12) & 63) << 2,
+    ((k >> 6) & 63) << 2,
+    (k & 63) << 2,
+];
 
 interface Group {
     lab: Lab;
@@ -158,7 +167,8 @@ export function extractTargetColors(
     let colors: WeightedColor[];
     let pixelBins: Int32Array | null = null;
     if (pixels) {
-        const ch = pixels.channels ?? (pixels.data.length === pixels.width * pixels.height * 4 ? 4 : 3);
+        const ch =
+            pixels.channels ?? (pixels.data.length === pixels.width * pixels.height * 4 ? 4 : 3);
         const n = pixels.width * pixels.height;
         pixelBins = new Int32Array(n);
         const counts = new Map<number, number>();
@@ -303,7 +313,9 @@ export function extractTargetColors(
                 const g = groups[a];
                 const h = groups[b];
                 const allClose = g.members.every((i) =>
-                    h.members.every((j) => deltaE2000Lab(clusters[i].lab, clusters[j].lab) < mergeDeltaE)
+                    h.members.every(
+                        (j) => deltaE2000Lab(clusters[i].lab, clusters[j].lab) < mergeDeltaE
+                    )
                 );
                 if (!allClose || protectedPair(g, h)) continue;
                 const w = g.w + h.w;
@@ -332,7 +344,8 @@ export function extractTargetColors(
             for (let j = 0; j < nC; j++) if (!g.members.includes(j)) boundary += contacts[i][j];
         }
         if (boundary === 0 || px / boundary > 1.5) return false;
-        const touches = (h: Group) => g.members.some((i) => h.members.some((j) => contacts[i][j] > 0));
+        const touches = (h: Group) =>
+            g.members.some((i) => h.members.some((j) => contacts[i][j] > 0));
         const cands = pool.filter((h) => h !== g && touches(h));
         for (let a = 0; a < cands.length; a++)
             for (let b = a + 1; b < cands.length; b++) {
@@ -340,7 +353,8 @@ export function extractTargetColors(
                 const B = cands[b].lab;
                 const d = { L: B.L - A.L, a: B.a - A.a, b: B.b - A.b };
                 const len2 = d.L ** 2 + d.a ** 2 + d.b ** 2 || 1;
-                const t = ((g.lab.L - A.L) * d.L + (g.lab.a - A.a) * d.a + (g.lab.b - A.b) * d.b) / len2;
+                const t =
+                    ((g.lab.L - A.L) * d.L + (g.lab.a - A.a) * d.a + (g.lab.b - A.b) * d.b) / len2;
                 if (t < 0.08 || t > 0.92) continue;
                 const P = { L: A.L + d.L * t, a: A.a + d.a * t, b: A.b + d.b * t };
                 if (deltaE2000Lab(P, g.lab) < 7) return true;
@@ -353,7 +367,8 @@ export function extractTargetColors(
     for (const g of groups) {
         if (isEdgeBlend(g, groups)) {
             let host = kept[0];
-            for (const k of kept) if (deltaE2000Lab(k.lab, g.lab) < deltaE2000Lab(host.lab, g.lab)) host = k;
+            for (const k of kept)
+                if (deltaE2000Lab(k.lab, g.lab) < deltaE2000Lab(host.lab, g.lab)) host = k;
             if (host) host.w += g.w;
             continue;
         }
@@ -362,7 +377,8 @@ export function extractTargetColors(
         if (g.w >= minWeight || nearest >= distinctDeltaE || isFeature(g)) kept.push(g);
         else if (kept.length) {
             let host = kept[0];
-            for (const k of kept) if (deltaE2000Lab(k.lab, g.lab) < deltaE2000Lab(host.lab, g.lab)) host = k;
+            for (const k of kept)
+                if (deltaE2000Lab(k.lab, g.lab) < deltaE2000Lab(host.lab, g.lab)) host = k;
             host.w += g.w;
         }
     }
@@ -381,7 +397,11 @@ export function extractTargetColors(
  * The unweighted range midpoint (not the weighted mean) is used so a dominant
  * background also moves away from small foreground colors.
  */
-export function expandContrast(targets: TargetColor[], strength: number, chroma = 1): TargetColor[] {
+export function expandContrast(
+    targets: TargetColor[],
+    strength: number,
+    chroma = 1
+): TargetColor[] {
     if (strength === 0 && chroma === 1) return targets;
     const Ls = targets.map((t) => t.lab.L);
     const mean = (Math.min(...Ls) + Math.max(...Ls)) / 2;
@@ -398,7 +418,11 @@ export function expandContrast(targets: TargetColor[], strength: number, chroma 
  * Share of all sharp-edge contacts that runs between each pair of targets.
  * High values mark pairs whose printed colors must stay distinguishable.
  */
-export function targetEdgeShares(pixels: ImagePixels, targets: TargetColor[], edgeDeltaE = 12): number[][] {
+export function targetEdgeShares(
+    pixels: ImagePixels,
+    targets: TargetColor[],
+    edgeDeltaE = 12
+): number[][] {
     const { width: W, height: H } = pixels;
     const ch = pixels.channels ?? (pixels.data.length === W * H * 4 ? 4 : 3);
     const n = targets.length;
@@ -516,7 +540,7 @@ const PRESETS: Record<AutoTunePreset, PresetDefinition> = {
             contrastStrengths: [0, 0.5],
             chromaBoosts: [1],
             contrastWeight: 0.7,
-            extract: { mergeDeltaE: 22, maxTargets: 5, distinctDeltaE: 40 },
+            extract: { mergeDeltaE: 12, maxTargets: 5 },
         },
         fidelityToStyled: true,
         style: (targets, filaments) => {
@@ -537,7 +561,14 @@ const PRESETS: Record<AutoTunePreset, PresetDefinition> = {
                 let bestScore = -Infinity;
                 for (const p of pool) {
                     const chroma = Math.hypot(p.lab.a, p.lab.b);
-                    const score = chroma - 1.5 * Math.abs(p.lab.L - wantL) - (used.has(p.f.id) ? 60 : 0);
+                    const taken = [...used].some(
+                        (id) =>
+                            deltaE2000Lab(
+                                labOfHex(pool.find((q) => q.f.id === id)!.f.color),
+                                p.lab
+                            ) < 8
+                    );
+                    const score = chroma - 1.5 * Math.abs(p.lab.L - wantL) - (taken ? 1000 : 0);
                     if (score > bestScore) {
                         bestScore = score;
                         best = p;
@@ -555,12 +586,12 @@ const PRESETS: Record<AutoTunePreset, PresetDefinition> = {
             contrastStrengths: [0.6, 1, 1.5],
             chromaBoosts: [1],
             contrastWeight: 0.9,
-            extract: { mergeDeltaE: 25, maxTargets: 3, distinctDeltaE: 45 },
+            extract: { mergeDeltaE: 12, maxTargets: 3 },
         },
     },
     // lightness only, neutral filaments
     grayscale: {
-        options: { contrastStrengths: [0, 0.3, 0.6], chromaBoosts: [1], contrastWeight: 0.6 },
+        options: { contrastStrengths: [0, 0.3, 0.6, 1], chromaBoosts: [1], contrastWeight: 0.7 },
         fidelityToStyled: true,
         style: (targets) => targets.map((t) => targetFromLab({ L: t.lab.L, a: 0, b: 0 }, t.weight)),
         filamentFilter: (f) => {
@@ -573,7 +604,9 @@ const PRESETS: Record<AutoTunePreset, PresetDefinition> = {
         options: { contrastStrengths: [-0.25, -0.1], chromaBoosts: [0.6], contrastWeight: 0.4 },
         fidelityToStyled: true,
         style: (targets) =>
-            targets.map((t) => targetFromLab({ L: t.lab.L, a: t.lab.a * 0.6 + 2, b: t.lab.b * 0.6 + 7 }, t.weight)),
+            targets.map((t) =>
+                targetFromLab({ L: t.lab.L, a: t.lab.a * 0.6 + 2, b: t.lab.b * 0.6 + 7 }, t.weight)
+            ),
     },
 };
 
@@ -581,16 +614,38 @@ const PRESETS: Record<AutoTunePreset, PresetDefinition> = {
  * Pick at most `max` filaments that are most useful for the targets
  * (always keeps the lightest one as a base for light colors).
  */
-export function selectFilamentSubset(filaments: Filament[], targets: TargetColor[], max: number): Filament[] {
+export function selectFilamentSubset(
+    filaments: Filament[],
+    targets: TargetColor[],
+    max: number
+): Filament[] {
     if (filaments.length <= max) return filaments;
+    // greedy coverage: each step adds the filament that most reduces the
+    // (sqrt-weighted) distance of targets to their closest chosen filament;
+    // near-identical filaments (e.g. two whites) are never both chosen
     const labs = filaments.map((f) => labOfHex(f.color));
-    const score = filaments.map((_, i) =>
-        targets.reduce((s, t) => s + Math.sqrt(t.weight) * Math.exp(-deltaE2000Lab(labs[i], t.lab) / 15), 0)
-    );
-    let lightest = 0;
-    for (let i = 1; i < labs.length; i++) if (labs[i].L > labs[lightest].L) lightest = i;
-    const order = filaments.map((_, i) => i).sort((a, b) => score[b] - score[a]);
-    const chosen = [lightest, ...order.filter((i) => i !== lightest)].slice(0, max);
+    const dist = labs.map((l) => targets.map((t) => deltaE2000Lab(l, t.lab)));
+    const err = targets.map(() => 60);
+    const chosen: number[] = [];
+    while (chosen.length < max) {
+        let best = -1;
+        let bestGain = -1;
+        for (let i = 0; i < filaments.length; i++) {
+            if (chosen.includes(i) || chosen.some((c) => deltaE2000Lab(labs[c], labs[i]) < 8))
+                continue;
+            const gain = targets.reduce(
+                (g, t, k) => g + Math.sqrt(t.weight) * Math.max(0, err[k] - dist[i][k]),
+                0
+            );
+            if (gain > bestGain) {
+                bestGain = gain;
+                best = i;
+            }
+        }
+        if (best < 0) break;
+        chosen.push(best);
+        targets.forEach((_, k) => (err[k] = Math.min(err[k], dist[best][k])));
+    }
     return chosen.map((i) => filaments[i]);
 }
 
@@ -658,93 +713,141 @@ export function autoTune(
         algorithm = 'balanced',
     } = options;
     const extracted = extractTargetColors(image, options.extract);
-    const adjacency = Array.isArray(image) ? null : targetEdgeShares(image as ImagePixels, extracted);
+    const adjacency = Array.isArray(image)
+        ? null
+        : targetEdgeShares(image as ImagePixels, extracted);
     let filaments = allFilaments;
     if (preset.filamentFilter) {
         const f = allFilaments.filter(preset.filamentFilter);
         if (f.length >= 2) filaments = f;
     }
     const styledBase = preset.style ? preset.style(extracted, filaments) : extracted;
-    if (options.maxFilaments && options.maxFilaments > 0)
-        filaments = selectFilamentSubset(filaments, styledBase, options.maxFilaments);
     // reference for fidelity scoring
     const original = preset.fidelityToStyled ? styledBase : extracted;
-    const candidates: AutoTuneCandidate[] = [];
+    const runCandidates = (filaments: Filament[]): AutoTuneCandidate[] => {
+        const candidates: AutoTuneCandidate[] = [];
 
-    for (const strength of contrastStrengths)
-    for (const chroma of chromaBoosts) {
-        const targets = expandContrast(styledBase, strength, chroma);
-        const swatches: AutoPaintImageSwatch[] = targets.map((t) => ({
-            hex: t.hex,
-            count: Math.max(1, Math.round(t.weight * 1e6)),
-        }));
-        for (const de of separationDeltaEs) {
-            let result: AutoPaintResult;
-            try {
-                result = generateAutoLayers(filaments, swatches, layerHeight, firstLayerHeight, maxHeight, true, false, {
-                    algorithm,
-                    maxExtraRepeats: 0,
-                    preserveSeparation: true,
-                    separationMaxDeltaE: de,
-                    failOnSeparationError: false,
-                });
-            } catch {
-                continue;
-            }
-            const mappings = result.finalStack.targetMappings;
-            if (mappings.length !== targets.length) continue;
-            const pred = mappings.map((m) => ({ L: m.predictedLab[0], a: m.predictedLab[1], b: m.predictedLab[2] }));
-            // fidelity against ORIGINAL colors
-            let fidelity = 0;
-            let worst = 0;
-            original.forEach((o, i) => {
-                const d = deltaE2000Lab(o.lab, pred[i]);
-                fidelity += d * o.weight;
-                worst = Math.max(worst, d);
-            });
-            // separation: predicted pairs should stay at least as far apart as the
-            // originals (capped at 25), weighted by the smaller region
-            let separationPenalty = 0;
-            for (let i = 0; i < original.length; i++)
-                for (let j = i + 1; j < original.length; j++) {
-                    const want = Math.min(25, deltaE2000Lab(original[i].lab, original[j].lab));
-                    const got = deltaE2000Lab(pred[i], pred[j]);
-                    // regions that meet along sharp edges (text on background) matter most
-                    const edgeShare = adjacency ? adjacency[i][j] : 0;
-                    const pairWeight =
-                        Math.sqrt(Math.min(original[i].weight, original[j].weight)) + 3 * edgeShare;
-                    separationPenalty += Math.max(0, want - got) * pairWeight;
-                    // printed layers tend to wash out lightness differences; ask for
-                    // at least the original lightness gap between the two regions
-                    const wantL = Math.abs(original[i].lab.L - original[j].lab.L);
-                    const gotL = Math.abs(pred[i].L - pred[j].L);
-                    separationPenalty += Math.max(0, wantL - gotL) * pairWeight;
+        for (const strength of contrastStrengths)
+            for (const chroma of chromaBoosts) {
+                const targets = expandContrast(styledBase, strength, chroma);
+                const swatches: AutoPaintImageSwatch[] = targets.map((t) => ({
+                    hex: t.hex,
+                    count: Math.max(1, Math.round(t.weight * 1e6)),
+                }));
+                for (const de of separationDeltaEs) {
+                    let result: AutoPaintResult;
+                    try {
+                        result = generateAutoLayers(
+                            filaments,
+                            swatches,
+                            layerHeight,
+                            firstLayerHeight,
+                            maxHeight,
+                            true,
+                            false,
+                            {
+                                algorithm,
+                                maxExtraRepeats: 0,
+                                preserveSeparation: true,
+                                separationMaxDeltaE: de,
+                                failOnSeparationError: false,
+                            }
+                        );
+                    } catch {
+                        continue;
+                    }
+                    const mappings = result.finalStack.targetMappings;
+                    if (mappings.length !== targets.length) continue;
+                    const pred = mappings.map((m) => ({
+                        L: m.predictedLab[0],
+                        a: m.predictedLab[1],
+                        b: m.predictedLab[2],
+                    }));
+                    // fidelity against ORIGINAL colors
+                    let fidelity = 0;
+                    let worst = 0;
+                    original.forEach((o, i) => {
+                        const d = deltaE2000Lab(o.lab, pred[i]);
+                        fidelity += d * o.weight;
+                        worst = Math.max(worst, d);
+                    });
+                    // separation: predicted pairs should stay at least as far apart as the
+                    // originals (capped at 25), weighted by the smaller region
+                    let separationPenalty = 0;
+                    for (let i = 0; i < original.length; i++)
+                        for (let j = i + 1; j < original.length; j++) {
+                            const want = Math.min(
+                                25,
+                                deltaE2000Lab(original[i].lab, original[j].lab)
+                            );
+                            const got = deltaE2000Lab(pred[i], pred[j]);
+                            // regions that meet along sharp edges (text on background) matter most
+                            const edgeShare = adjacency ? adjacency[i][j] : 0;
+                            const pairWeight =
+                                Math.sqrt(Math.min(original[i].weight, original[j].weight)) +
+                                3 * edgeShare;
+                            separationPenalty += Math.max(0, want - got) * pairWeight;
+                            // printed layers tend to wash out lightness differences; ask for
+                            // at least the original lightness gap between the two regions
+                            const wantL = Math.abs(original[i].lab.L - original[j].lab.L);
+                            const gotL = Math.abs(pred[i].L - pred[j].L);
+                            separationPenalty += Math.max(0, wantL - gotL) * pairWeight;
+                        }
+                    const separated = result.colorSeparation?.satisfied ?? false;
+                    const score =
+                        (1 - contrastWeight) * fidelity +
+                        contrastWeight * separationPenalty * 2 +
+                        (separated ? 0 : 5) +
+                        result.totalHeight * 0.5;
+                    candidates.push({
+                        contrastStrength: strength,
+                        chromaBoost: chroma,
+                        separationDeltaE: de,
+                        targets,
+                        predicted: mappings.map((m) => m.predictedColor.hex),
+                        score,
+                        fidelity,
+                        worstFidelity: worst,
+                        separationPenalty,
+                        separated,
+                        totalHeight: result.totalHeight,
+                        filamentOrder: result.filamentOrder,
+                        result,
+                    });
                 }
-            const separated = result.colorSeparation?.satisfied ?? false;
-            const score =
-                (1 - contrastWeight) * fidelity +
-                contrastWeight * separationPenalty * 2 +
-                (separated ? 0 : 5) +
-                result.totalHeight * 0.5;
-            candidates.push({
-                contrastStrength: strength,
-                chromaBoost: chroma,
-                separationDeltaE: de,
-                targets,
-                predicted: mappings.map((m) => m.predictedColor.hex),
-                score,
-                fidelity,
-                worstFidelity: worst,
-                separationPenalty,
-                separated,
-                totalHeight: result.totalHeight,
-                filamentOrder: result.filamentOrder,
-                result,
-            });
+            }
+        candidates.sort((x, y) => x.score - y.score);
+        return candidates;
+    };
+
+    let candidates: AutoTuneCandidate[];
+    const maxF = options.maxFilaments ?? 0;
+    if (maxF > 0 && filaments.length > maxF) {
+        // start from a coverage-based subset, then improve it by single swaps
+        // judged on the real Auto-paint score (mixing matters: green under white = sage)
+        let subset = selectFilamentSubset(filaments, styledBase, maxF);
+        candidates = runCandidates(subset);
+        for (let round = 0; round < 3; round++) {
+            let improved = false;
+            for (let i = 0; i < subset.length; i++)
+                for (const f of filaments) {
+                    if (subset.includes(f)) continue;
+                    const trial = subset.map((x, k) => (k === i ? f : x));
+                    const c = runCandidates(trial);
+                    if (
+                        c.length &&
+                        (!candidates.length || c[0].score < candidates[0].score - 1e-6)
+                    ) {
+                        subset = trial;
+                        candidates = c;
+                        improved = true;
+                    }
+                }
+            if (!improved) break;
         }
-    }
-    if (candidates.length === 0) throw new Error('autoTune: no Auto-paint candidate could be generated');
-    candidates.sort((x, y) => x.score - y.score);
+    } else candidates = runCandidates(filaments);
+    if (candidates.length === 0)
+        throw new Error('autoTune: no Auto-paint candidate could be generated');
     const best = candidates[0];
     const unreachable = (preset.fidelityToStyled ? [] : original)
         .map((o, i) => ({
