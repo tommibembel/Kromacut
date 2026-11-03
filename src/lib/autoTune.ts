@@ -115,7 +115,35 @@ function kmeansLab(points: { lab: Lab; w: number }[], k: number, iterations = 25
     return centers.map((lab, c) => ({ lab, w: weights[c] })).filter((c) => c.w > 0);
 }
 
-export function extractTargetColors(colors: WeightedColor[], options: ExtractOptions = {}): TargetColor[] {
+/** Downscaled image pixels, RGB or RGBA, row-major. */
+export interface ImagePixels {
+    width: number;
+    height: number;
+    data: ArrayLike<number>;
+    channels?: 3 | 4;
+}
+
+const binKey = (r: number, g: number, b: number) => ((r >> 2) << 12) | ((g >> 2) << 6) | (b >> 2);
+const binRgb = (k: number): [number, number, number] => [((k >> 12) & 63) << 2, ((k >> 6) & 63) << 2, (k & 63) << 2];
+
+interface Group {
+    lab: Lab;
+    w: number;
+    members: number[]; // original cluster indices
+}
+
+/**
+ * Find the target colors of an image.
+ *
+ * With pixel input the extractor is edge-aware: two color groups that meet
+ * along a sharp edge (text on background, outlines) are never merged, and a
+ * small group survives when it forms a connected blob with a sharp boundary
+ * (a beard, a thin stripe) instead of scattered noise.
+ */
+export function extractTargetColors(
+    input: WeightedColor[] | ImagePixels,
+    options: ExtractOptions = {}
+): TargetColor[] {
     const {
         maxClusters = 16,
         mergeDeltaE = 10,
@@ -124,40 +152,221 @@ export function extractTargetColors(colors: WeightedColor[], options: ExtractOpt
         absoluteMinWeight = 0.00005,
         maxTargets = 8,
     } = options;
+
+    // ---- histogram -------------------------------------------------------
+    const pixels = Array.isArray(input) ? null : (input as ImagePixels);
+    let colors: WeightedColor[];
+    let pixelBins: Int32Array | null = null;
+    if (pixels) {
+        const ch = pixels.channels ?? (pixels.data.length === pixels.width * pixels.height * 4 ? 4 : 3);
+        const n = pixels.width * pixels.height;
+        pixelBins = new Int32Array(n);
+        const counts = new Map<number, number>();
+        for (let i = 0; i < n; i++) {
+            const o = i * ch;
+            if (ch === 4 && pixels.data[o + 3] < 128) {
+                pixelBins[i] = -1;
+                continue;
+            }
+            const k = binKey(pixels.data[o], pixels.data[o + 1], pixels.data[o + 2]);
+            pixelBins[i] = k;
+            counts.set(k, (counts.get(k) ?? 0) + 1);
+        }
+        colors = [...counts].map(([k, count]) => ({ hex: hexOf(binRgb(k)), count }));
+    } else colors = input as WeightedColor[];
+
     const total = colors.reduce((s, c) => s + c.count, 0) || 1;
     const points = colors.map((c) => ({ lab: rgbToLab(parseHex(c.hex)), w: c.count / total }));
-    let clusters = kmeansLab(points, maxClusters);
+    const clusters = kmeansLab(points, maxClusters);
+    const nC = clusters.length;
+    const nearestCluster = (lab: Lab) => {
+        let bi = 0;
+        let bd = Infinity;
+        for (let c = 0; c < nC; c++) {
+            const d = labDist2(lab, clusters[c].lab);
+            if (d < bd) {
+                bd = d;
+                bi = c;
+            }
+        }
+        return bi;
+    };
 
-    // merge near-duplicates (heaviest first absorbs)
-    clusters.sort((x, y) => y.w - x.w);
-    const merged: { lab: Lab; w: number }[] = [];
-    for (const c of clusters) {
-        const host = merged.find((m) => deltaE2000Lab(m.lab, c.lab) < mergeDeltaE);
-        if (host) {
-            const w = host.w + c.w;
-            host.lab = {
-                L: (host.lab.L * host.w + c.lab.L * c.w) / w,
-                a: (host.lab.a * host.w + c.lab.a * c.w) / w,
-                b: (host.lab.b * host.w + c.lab.b * c.w) / w,
-            };
-            host.w = w;
-        } else merged.push({ lab: { ...c.lab }, w: c.w });
-    }
-    merged.sort((x, y) => y.w - x.w);
-
-    // keep big ones; keep small ones only if clearly distinct from all kept ones
-    const kept: { lab: Lab; w: number }[] = [];
-    for (const c of merged) {
-        if (c.w < absoluteMinWeight) continue;
-        const nearest = kept.reduce((m, k) => Math.min(m, deltaE2000Lab(k.lab, c.lab)), Infinity);
-        if (c.w >= minWeight || nearest >= distinctDeltaE) kept.push(c);
-        else {
-            // fold its weight into the nearest kept color so totals stay meaningful
-            let host = kept[0];
-            for (const k of kept) if (deltaE2000Lab(k.lab, c.lab) < deltaE2000Lab(host.lab, c.lab)) host = k;
-            if (host) host.w += c.w;
+    // ---- spatial statistics (pixel input only) ------------------------------
+    // contacts[i][j]: neighbouring pixel pairs between clusters; sharp[i][j]: of those, sharp edges
+    const contacts = Array.from({ length: nC }, () => new Float64Array(nC));
+    const sharp = Array.from({ length: nC }, () => new Float64Array(nC));
+    const largestBlob = new Float64Array(nC).fill(Infinity);
+    const pixelCount = new Float64Array(nC);
+    if (pixels && pixelBins) {
+        const { width: W, height: H } = pixels;
+        const binCluster = new Map<number, number>();
+        const binLab = new Map<number, Lab>();
+        const label = new Int32Array(W * H);
+        for (let i = 0; i < W * H; i++) {
+            const k = pixelBins[i];
+            if (k < 0) {
+                label[i] = -1;
+                continue;
+            }
+            let c = binCluster.get(k);
+            if (c === undefined) {
+                const lab = rgbToLab(binRgb(k));
+                binLab.set(k, lab);
+                c = nearestCluster(lab);
+                binCluster.set(k, c);
+            }
+            label[i] = c;
+            pixelCount[c]++;
+        }
+        const EDGE_DE = 12;
+        const edge = (i: number, j: number) => {
+            const a = label[i];
+            const b = label[j];
+            if (a < 0 || b < 0 || a === b) return;
+            contacts[a][b]++;
+            contacts[b][a]++;
+            if (deltaE2000Lab(binLab.get(pixelBins![i])!, binLab.get(pixelBins![j])!) > EDGE_DE) {
+                sharp[a][b]++;
+                sharp[b][a]++;
+            }
+        };
+        for (let y = 0; y < H; y++)
+            for (let x = 0; x < W; x++) {
+                const i = y * W + x;
+                if (x + 1 < W) edge(i, i + 1);
+                if (y + 1 < H) edge(i, i + W);
+            }
+        // largest 4-connected component per cluster
+        largestBlob.fill(0);
+        const seen = new Uint8Array(W * H);
+        const stack: number[] = [];
+        for (let s = 0; s < W * H; s++) {
+            if (seen[s] || label[s] < 0) continue;
+            const c = label[s];
+            let size = 0;
+            stack.push(s);
+            seen[s] = 1;
+            while (stack.length) {
+                const i = stack.pop()!;
+                size++;
+                const x = i % W;
+                const nb = [x > 0 ? i - 1 : -1, x + 1 < W ? i + 1 : -1, i - W, i + W];
+                for (const j of nb)
+                    if (j >= 0 && j < W * H && !seen[j] && label[j] === c) {
+                        seen[j] = 1;
+                        stack.push(j);
+                    }
+            }
+            if (size > largestBlob[c]) largestBlob[c] = size;
         }
     }
+    const totalPixels = pixels ? pixels.width * pixels.height : 0;
+
+    // groups share a protected (sharp) boundary?
+    const protectedPair = (g: Group, h: Group) => {
+        if (!pixels) return false;
+        let c = 0;
+        let s = 0;
+        for (const i of g.members)
+            for (const j of h.members) {
+                c += contacts[i][j];
+                s += sharp[i][j];
+            }
+        return s >= 8 && s >= 0.35 * c;
+    };
+    // a small group is a real feature: one blob of a few pixels with a mostly sharp outline
+    const isFeature = (g: Group) => {
+        if (!pixels) return false;
+        let c = 0;
+        let s = 0;
+        let blob = 0;
+        for (const i of g.members) {
+            blob = Math.max(blob, largestBlob[i]);
+            for (let j = 0; j < nC; j++)
+                if (!g.members.includes(j)) {
+                    c += contacts[i][j];
+                    s += sharp[i][j];
+                }
+        }
+        return blob >= Math.max(12, totalPixels * 0.00008) && c > 0 && s >= 0.5 * c;
+    };
+
+    // ---- merge near-duplicates (complete linkage, never across sharp edges) ----
+    let groups: Group[] = clusters
+        .map((c, i) => ({ lab: { ...c.lab }, w: c.w, members: [i] }))
+        .sort((x, y) => y.w - x.w);
+    for (let changed = true; changed; ) {
+        changed = false;
+        outer: for (let a = 0; a < groups.length; a++)
+            for (let b = a + 1; b < groups.length; b++) {
+                const g = groups[a];
+                const h = groups[b];
+                const allClose = g.members.every((i) =>
+                    h.members.every((j) => deltaE2000Lab(clusters[i].lab, clusters[j].lab) < mergeDeltaE)
+                );
+                if (!allClose || protectedPair(g, h)) continue;
+                const w = g.w + h.w;
+                g.lab = {
+                    L: (g.lab.L * g.w + h.lab.L * h.w) / w,
+                    a: (g.lab.a * g.w + h.lab.a * h.w) / w,
+                    b: (g.lab.b * g.w + h.lab.b * h.w) / w,
+                };
+                g.w = w;
+                g.members.push(...h.members);
+                groups.splice(b, 1);
+                changed = true;
+                break outer;
+            }
+    }
+    groups.sort((x, y) => y.w - x.w);
+
+    // an edge-blend: small, thin group whose color lies between two groups it touches
+    // (anti-aliasing / JPEG ringing around text and outlines)
+    const isEdgeBlend = (g: Group, pool: Group[]) => {
+        if (!pixels || g.w >= minWeight) return false;
+        let px = 0;
+        let boundary = 0;
+        for (const i of g.members) {
+            px += pixelCount[i];
+            for (let j = 0; j < nC; j++) if (!g.members.includes(j)) boundary += contacts[i][j];
+        }
+        if (boundary === 0 || px / boundary > 1.5) return false;
+        const touches = (h: Group) => g.members.some((i) => h.members.some((j) => contacts[i][j] > 0));
+        const cands = pool.filter((h) => h !== g && touches(h));
+        for (let a = 0; a < cands.length; a++)
+            for (let b = a + 1; b < cands.length; b++) {
+                const A = cands[a].lab;
+                const B = cands[b].lab;
+                const d = { L: B.L - A.L, a: B.a - A.a, b: B.b - A.b };
+                const len2 = d.L ** 2 + d.a ** 2 + d.b ** 2 || 1;
+                const t = ((g.lab.L - A.L) * d.L + (g.lab.a - A.a) * d.a + (g.lab.b - A.b) * d.b) / len2;
+                if (t < 0.08 || t > 0.92) continue;
+                const P = { L: A.L + d.L * t, a: A.a + d.a * t, b: A.b + d.b * t };
+                if (deltaE2000Lab(P, g.lab) < 7) return true;
+            }
+        return false;
+    };
+
+    // ---- keep big groups, distinct small ones and real small features ----------
+    const kept: Group[] = [];
+    for (const g of groups) {
+        if (isEdgeBlend(g, groups)) {
+            let host = kept[0];
+            for (const k of kept) if (deltaE2000Lab(k.lab, g.lab) < deltaE2000Lab(host.lab, g.lab)) host = k;
+            if (host) host.w += g.w;
+            continue;
+        }
+        if (g.w < absoluteMinWeight && !isFeature(g)) continue;
+        const nearest = kept.reduce((m, k) => Math.min(m, deltaE2000Lab(k.lab, g.lab)), Infinity);
+        if (g.w >= minWeight || nearest >= distinctDeltaE || isFeature(g)) kept.push(g);
+        else if (kept.length) {
+            let host = kept[0];
+            for (const k of kept) if (deltaE2000Lab(k.lab, g.lab) < deltaE2000Lab(host.lab, g.lab)) host = k;
+            host.w += g.w;
+        }
+    }
+    // if more than maxTargets survive, keep the heaviest but always the features
     kept.sort((x, y) => y.w - x.w);
     const out = kept.slice(0, maxTargets);
     const sum = out.reduce((s, c) => s + c.w, 0) || 1;
@@ -219,7 +428,7 @@ export interface AutoTuneResult {
 }
 
 export function autoTune(
-    image: WeightedColor[],
+    image: WeightedColor[] | ImagePixels,
     filaments: Filament[],
     options: AutoTuneOptions
 ): AutoTuneResult {
@@ -315,7 +524,18 @@ export function autoTune(
                 b: best.result.finalStack.targetMappings[i].predictedLab[2],
             }),
         }))
-        .filter((u) => u.deltaE > 20);
+        .filter((u, i) => {
+            if (u.deltaE > 20) return true;
+            // hue shift on clearly colored targets (e.g. purple printed as blue)
+            const o = original[i].lab;
+            const m = best.result.finalStack.targetMappings[i].predictedLab;
+            const co = Math.hypot(o.a, o.b);
+            const cp = Math.hypot(m[1], m[2]);
+            if (co < 15 || cp < 10) return co >= 25 && cp < 8; // vivid color printed grey
+            let dh = Math.abs(Math.atan2(o.b, o.a) - Math.atan2(m[2], m[1])) * (180 / Math.PI);
+            if (dh > 180) dh = 360 - dh;
+            return dh > 35;
+        });
     return {
         originalTargets: original,
         best,
