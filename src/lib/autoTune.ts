@@ -534,7 +534,7 @@ export function autoTune(
             if (co < 15 || cp < 10) return co >= 25 && cp < 8; // vivid color printed grey
             let dh = Math.abs(Math.atan2(o.b, o.a) - Math.atan2(m[2], m[1])) * (180 / Math.PI);
             if (dh > 180) dh = 360 - dh;
-            return dh > 35;
+            return dh > 20;
         });
     return {
         originalTargets: original,
