@@ -381,15 +381,75 @@ export function extractTargetColors(
  * The unweighted range midpoint (not the weighted mean) is used so a dominant
  * background also moves away from small foreground colors.
  */
-export function expandContrast(targets: TargetColor[], strength: number): TargetColor[] {
-    if (strength <= 0) return targets;
+export function expandContrast(targets: TargetColor[], strength: number, chroma = 1): TargetColor[] {
+    if (strength <= 0 && chroma === 1) return targets;
     const Ls = targets.map((t) => t.lab.L);
     const mean = (Math.min(...Ls) + Math.max(...Ls)) / 2;
     return targets.map((t) => {
         const L = Math.max(0, Math.min(100, mean + (t.lab.L - mean) * (1 + strength)));
-        const rgb = labToRgb({ L, a: t.lab.a, b: t.lab.b }) as [number, number, number];
+        const rgb = labToRgb({ L, a: t.lab.a * chroma, b: t.lab.b * chroma }) as [number, number, number];
         return { hex: hexOf(rgb), lab: rgbToLab(rgb), weight: t.weight };
     });
+}
+
+/**
+ * Share of all sharp-edge contacts that runs between each pair of targets.
+ * High values mark pairs whose printed colors must stay distinguishable.
+ */
+export function targetEdgeShares(pixels: ImagePixels, targets: TargetColor[], edgeDeltaE = 12): number[][] {
+    const { width: W, height: H } = pixels;
+    const ch = pixels.channels ?? (pixels.data.length === W * H * 4 ? 4 : 3);
+    const n = targets.length;
+    const label = new Int32Array(W * H);
+    const labs: Lab[] = new Array(W * H);
+    const cache = new Map<number, number>();
+    const labCache = new Map<number, Lab>();
+    for (let i = 0; i < W * H; i++) {
+        const o = i * ch;
+        if (ch === 4 && pixels.data[o + 3] < 128) {
+            label[i] = -1;
+            continue;
+        }
+        const k = binKey(pixels.data[o], pixels.data[o + 1], pixels.data[o + 2]);
+        let lab = labCache.get(k);
+        if (!lab) {
+            lab = rgbToLab(binRgb(k));
+            labCache.set(k, lab);
+        }
+        labs[i] = lab;
+        let t = cache.get(k);
+        if (t === undefined) {
+            t = 0;
+            let bd = Infinity;
+            for (let c = 0; c < n; c++) {
+                const d = labDist2(lab, targets[c].lab);
+                if (d < bd) {
+                    bd = d;
+                    t = c;
+                }
+            }
+            cache.set(k, t);
+        }
+        label[i] = t;
+    }
+    const sharp = Array.from({ length: n }, () => new Array<number>(n).fill(0));
+    let total = 0;
+    const edge = (i: number, j: number) => {
+        const a = label[i];
+        const b = label[j];
+        if (a < 0 || b < 0 || a === b) return;
+        if (deltaE2000Lab(labs[i], labs[j]) <= edgeDeltaE) return;
+        sharp[a][b]++;
+        sharp[b][a]++;
+        total++;
+    };
+    for (let y = 0; y < H; y++)
+        for (let x = 0; x < W; x++) {
+            const i = y * W + x;
+            if (x + 1 < W) edge(i, i + 1);
+            if (y + 1 < H) edge(i, i + W);
+        }
+    return sharp.map((row) => row.map((v) => (total ? v / total : 0)));
 }
 
 export interface AutoTuneOptions {
@@ -397,6 +457,8 @@ export interface AutoTuneOptions {
     firstLayerHeight: number;
     maxHeight?: number;
     contrastStrengths?: number[];
+    /** Chroma multipliers tried for the targets (pastel images print grey otherwise). */
+    chromaBoosts?: number[];
     separationDeltaEs?: number[];
     /** 0 = only fidelity, 1 = strongly prefer separation between targets. */
     contrastWeight?: number;
@@ -406,6 +468,7 @@ export interface AutoTuneOptions {
 
 export interface AutoTuneCandidate {
     contrastStrength: number;
+    chromaBoost: number;
     separationDeltaE: number;
     targets: TargetColor[];
     predicted: string[];
@@ -436,16 +499,19 @@ export function autoTune(
         layerHeight,
         firstLayerHeight,
         maxHeight,
-        contrastStrengths = [0, 0.2, 0.4, 0.6],
-        separationDeltaEs = [6, 10, 15],
+        contrastStrengths = [0, 0.3, 0.6, 1.0, 1.5],
+        chromaBoosts = [1, 1.6],
+        separationDeltaEs = [6, 12],
         contrastWeight = 0.6,
         algorithm = 'balanced',
     } = options;
     const original = extractTargetColors(image, options.extract);
+    const adjacency = Array.isArray(image) ? null : targetEdgeShares(image as ImagePixels, original);
     const candidates: AutoTuneCandidate[] = [];
 
-    for (const strength of contrastStrengths) {
-        const targets = expandContrast(original, strength);
+    for (const strength of contrastStrengths)
+    for (const chroma of chromaBoosts) {
+        const targets = expandContrast(original, strength, chroma);
         const swatches: AutoPaintImageSwatch[] = targets.map((t) => ({
             hex: t.hex,
             count: Math.max(1, Math.round(t.weight * 1e6)),
@@ -481,7 +547,10 @@ export function autoTune(
                 for (let j = i + 1; j < original.length; j++) {
                     const want = Math.min(25, deltaE2000Lab(original[i].lab, original[j].lab));
                     const got = deltaE2000Lab(pred[i], pred[j]);
-                    const pairWeight = Math.sqrt(Math.min(original[i].weight, original[j].weight));
+                    // regions that meet along sharp edges (text on background) matter most
+                    const edgeShare = adjacency ? adjacency[i][j] : 0;
+                    const pairWeight =
+                        Math.sqrt(Math.min(original[i].weight, original[j].weight)) + 3 * edgeShare;
                     separationPenalty += Math.max(0, want - got) * pairWeight;
                     // printed layers tend to wash out lightness differences; ask for
                     // at least the original lightness gap between the two regions
@@ -497,6 +566,7 @@ export function autoTune(
                 result.totalHeight * 0.5;
             candidates.push({
                 contrastStrength: strength,
+                chromaBoost: chroma,
                 separationDeltaE: de,
                 targets,
                 predicted: mappings.map((m) => m.predictedColor.hex),
