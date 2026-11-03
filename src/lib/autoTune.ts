@@ -387,7 +387,9 @@ export function expandContrast(targets: TargetColor[], strength: number, chroma 
     const mean = (Math.min(...Ls) + Math.max(...Ls)) / 2;
     return targets.map((t) => {
         const L = Math.max(0, Math.min(100, mean + (t.lab.L - mean) * (1 + strength)));
-        const rgb = labToRgb({ L, a: t.lab.a * chroma, b: t.lab.b * chroma }) as [number, number, number];
+        // do not tint near-white/near-black targets: boosted cream prints as yellow
+        const k = t.lab.L > 85 || t.lab.L < 20 ? 1 : chroma;
+        const rgb = labToRgb({ L, a: t.lab.a * k, b: t.lab.b * k }) as [number, number, number];
         return { hex: hexOf(rgb), lab: rgbToLab(rgb), weight: t.weight };
     });
 }
